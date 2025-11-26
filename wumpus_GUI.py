@@ -5,7 +5,7 @@ from pygame.locals import *
 
 # -----------------------------------------------------------------------------
 # CLASE 1: EL MUNDO DE WUMPUS (EL SIMULADOR)
-# - NO MODIFICAR ESTA CLASE -
+#MODIFICADA PARA INCLUIR FLECHAS -
 # -----------------------------------------------------------------------------
 class WumpusWorld:
     """
@@ -17,9 +17,10 @@ class WumpusWorld:
         self.agent_location = (1, 1)
         self.agent_has_gold = False
         self.agent_is_alive = True
+        self.agent_has_arrow = True  # El agente comienza con una flecha
+        self.wumpus_is_alive = True  # El Wumpus comienza vivo
 
         # Inicializa un tablero vacío
-        # (W: Wumpus, P: Pozo, G: Oro, A: Agente)
         self.board = { (x,y): [] for x in range(1, size+1) for y in range(1, size+1) }
 
         # Colocar Oro
@@ -30,7 +31,7 @@ class WumpusWorld:
         self.wumpus_location = self._get_random_empty_cell()
         self.board[self.wumpus_location].append('W')
 
-        # Colocar Pozos (Pits) - 20% de probabilidad por casilla
+        # Colocar Pozos 20% de probabilidad por casilla
         for x in range(1, size + 1):
             for y in range(1, size + 1):
                 if (x, y) != (1, 1) and (x, y) not in [self.gold_location, self.wumpus_location]:
@@ -70,16 +71,18 @@ class WumpusWorld:
         if 'G' in self.board[location]:
             percepts['glitter'] = True
 
-        # Comprobar si hay peligros adyacentes
+        # Comprobar si hay peligros adyacentes (solo si el Wumpus está vivo)
+        if self.wumpus_is_alive:
+            for nx, ny in self.get_neighbors(x, y):
+                if 'W' in self.board[(nx, ny)]:
+                    percepts['stench'] = True
         for nx, ny in self.get_neighbors(x, y):
-            if 'W' in self.board[(nx, ny)]:
-                percepts['stench'] = True
             if 'P' in self.board[(nx, ny)]:
                 percepts['breeze'] = True
 
         return percepts
 
-    def execute_action(self, action):
+    def execute_action(self, action, direction=None):
         """ Ejecuta la acción del agente y devuelve el estado. """
         if not self.agent_is_alive:
             return "El agente está muerto."
@@ -109,11 +112,39 @@ class WumpusWorld:
                     return "El agente escapó sin el oro."
             else:
                 return "Solo se puede salir desde (1, 1)."
+        elif action == 'shoot_arrow':
+            if not self.agent_has_arrow:
+                return "No tienes flechas."
+            
+            self.agent_has_arrow = False
+            # Determinar la dirección del disparo
+            if direction == 'up':
+                target_cells = [(x, y + i) for i in range(1, self.size + 1) if self._is_valid_location(x, y + i)]
+            elif direction == 'down':
+                target_cells = [(x, y - i) for i in range(1, self.size + 1) if self._is_valid_location(x, y - i)]
+            elif direction == 'left':
+                target_cells = [(x - i, y) for i in range(1, self.size + 1) if self._is_valid_location(x - i, y)]
+            elif direction == 'right':
+                target_cells = [(x + i, y) for i in range(1, self.size + 1) if self._is_valid_location(x + i, y)]
+            else:
+                return "Dirección de disparo no válida."
+            
+            # Verificar si el Wumpus está en alguna de las celdas objetivo
+            for cell in target_cells:
+                if cell == self.wumpus_location and self.wumpus_is_alive:
+                    self.wumpus_is_alive = False
+                    self.board[cell].remove('W')
+                    return "¡Escuchas un grito! Has matado al Wumpus."
+            
+            return "La flecha no golpeó nada."
 
         # Comprobar si el agente muere después de moverse
-        if 'W' in self.board[self.agent_location] or 'P' in self.board[self.agent_location]:
+        if 'W' in self.board[self.agent_location] and self.wumpus_is_alive:
             self.agent_is_alive = False
-            return "¡MUERTE! El agente cayó en un pozo o fue comido por el Wumpus."
+            return "¡MUERTE! El agente fue comido por el Wumpus."
+        if 'P' in self.board[self.agent_location]:
+            self.agent_is_alive = False
+            return "¡MUERTE! El agente cayó en un pozo."
 
         return f"Agente se movió a {self.agent_location}"
 
@@ -150,6 +181,7 @@ class KnowledgeBase:
 
 # -----------------------------------------------------------------------------
 # CLASE 3: EL AGENTE LÓGICO
+# - MODIFICADA PARA INCLUIR RETROCESO Y DISPARO MEJORADO -
 # -----------------------------------------------------------------------------
 class LogicalAgent:
     """
@@ -160,10 +192,13 @@ class LogicalAgent:
         self.kb = kb
         self.location = (1, 1) # El agente siempre empieza en (1, 1)
         self.visited_squares = set() # Un conjunto de tuplas (x, y)
+        self.path_stack = []  # Pila para realizar backtracking
+        self.wumpus_killed = False  # Para saber si el Wumpus fue eliminado
 
         # El agente sabe que la casilla (1, 1) es segura al empezar
         self.kb.tell("Safe at (1, 1)")
         self.visited_squares.add((1, 1))
+        self.path_stack.append((1, 1))  # Comienza en (1, 1)
 
     def procesar_perceptos(self, percepts):
         """
@@ -172,15 +207,33 @@ class LogicalAgent:
         """
         x, y = self.location
 
+        # Solo registrar brisa/hedor si no los hemos registrado antes
+        current_breeze = f"Breeze at ({x}, {y})"
+        current_no_breeze = f"No Breeze at ({x}, {y})"
+        current_stench = f"Stench at ({x}, {y})"
+        current_no_stench = f"No Stench at ({x}, {y})"
+
         if percepts['breeze']:
-            self.kb.tell(f"Breeze at ({x}, {y})")
+            if not self.kb.ask(current_breeze):
+                self.kb.tell(current_breeze)
+                print(f"DEBUG: Registrada brisa en ({x}, {y})")
         else:
-            self.kb.tell(f"No Breeze at ({x}, {y})")
+            if not self.kb.ask(current_no_breeze):
+                self.kb.tell(current_no_breeze)
+                print(f"DEBUG: Registrada NO brisa en ({x}, {y})")
 
         if percepts['stench']:
-            self.kb.tell(f"Stench at ({x}, {y})")
+            if not self.kb.ask(current_stench):
+                self.kb.tell(current_stench)
+                print(f"DEBUG: Registrado hedor en ({x}, {y})")
         else:
-            self.kb.tell(f"No Stench at ({x}, {y})")
+            if not self.kb.ask(current_no_stench):
+                self.kb.tell(current_no_stench)
+                print(f"DEBUG: Registrado NO hedor en ({x}, {y})")
+
+        # Siempre registrar brillo si está presente
+        if percepts['glitter']:
+            self.kb.tell(f"Glitter at ({x}, {y})")
 
     def inferir_seguridad(self):
         """
@@ -188,37 +241,66 @@ class LogicalAgent:
         Este es el paso de 'INFERENCIA'.
         """
 
-        # Regla 1: Inferir seguridad de pozos
+        # Regla 1: Las casillas visitadas son seguras 
         for location in self.visited_squares:
             if self.world.agent_is_alive:
                 self.kb.tell(f"Safe at {location}")
 
-        # Regla 2: Inferir seguridad del Wumpus
+        # Regla 2: Si no hay hedor, los vecinos son seguros del Wumpus
         no_stench_facts = self.kb.get_facts_starting_with("No Stench at")
         for fact in no_stench_facts:
             x, y = eval(fact.split(' at ')[1])
-
             for nx, ny in self.world.get_neighbors(x, y):
-                # Si no hay hedor, sus vecinas son seguras del Wumpus
-                self.kb.tell(f"Safe at ({nx}, {ny})")
-                
+                if not self.kb.ask(f"Danger at ({nx}, {ny})"):
+                    self.kb.tell(f"Safe at ({nx}, {ny})")
+                    
         # -------------------------------------------------------------------------
-        # NUEVO: Reglas para inferir PELIGRO
+        # REGLAS  PARA INFERIR PELIGRO
         # -------------------------------------------------------------------------
             
         # Regla 3: Si hay brisa, algun vecino tiene pozo
         breeze_facts = self.kb.get_facts_starting_with("Breeze at")
-        for fact in breeze_facts:
-            x, y = eval(fact.split(' at ')[1])
+        
+        # Primero, identificar todas las casillas con brisa
+        breeze_locations = [eval(fact.split(' at ')[1]) for fact in breeze_facts]
+        
+        for breeze_loc in breeze_locations:
+            x, y = breeze_loc
             neighbors = self.world.get_neighbors(x, y)
-                
-            # Si todos los vecinos excepto uno son seguros, el restante es peligroso
-            safe_neighbors = [n for n in neighbors if self.kb.ask(f"Safe at {n}")]
-            if len(safe_neighbors) == len(neighbors) - 1:
-                dangerous = [n for n in neighbors if n not in safe_neighbors][0]
+            
+            # Filtrar vecinos que ya sabemos que son seguros
+            unsafe_neighbors = [n for n in neighbors if not self.kb.ask(f"Safe at {n}")]
+            
+            # Si solo hay un vecino no seguro, debe ser un pozo
+            if len(unsafe_neighbors) == 1:
+                dangerous = unsafe_neighbors[0]
                 self.kb.tell(f"Danger at {dangerous}")
+                self.kb.tell(f"Pit at {dangerous}")
+                print(f"DEBUG: Pozo inferido en {dangerous} por brisa en {breeze_loc}")
 
-        # Regla 4: Si hay hedor, algun vecino tiene Wumpus  
+        # Regla 4: Inferencia mejorada para múltiples brisas
+        if len(breeze_locations) >= 2:
+            # Buscar intersecciones de vecinos entre casillas con brisa
+            possible_pit_locations = set()
+            
+            for i, loc1 in enumerate(breeze_locations):
+                neighbors1 = set(self.world.get_neighbors(loc1[0], loc1[1]))
+                for j, loc2 in enumerate(breeze_locations):
+                    if i != j:
+                        neighbors2 = set(self.world.get_neighbors(loc2[0], loc2[1]))
+                        intersection = neighbors1.intersection(neighbors2)
+                        # Solo considerar intersecciones que no son seguras
+                        intersection = [loc for loc in intersection if not self.kb.ask(f"Safe at {loc}")]
+                        possible_pit_locations.update(intersection)
+            
+            # Si hay una única ubicación posible para el pozo, inferirla
+            if len(possible_pit_locations) == 1:
+                pit_loc = list(possible_pit_locations)[0]
+                self.kb.tell(f"Danger at {pit_loc}")
+                self.kb.tell(f"Pit at {pit_loc}")
+                print(f"DEBUG: Pozo inferido en {pit_loc} por múltiples brisas")
+
+        # Regla 5: Si hay hedor, algun vecino tiene Wumpus  
         stench_facts = self.kb.get_facts_starting_with("Stench at")
         for fact in stench_facts:
             x, y = eval(fact.split(' at ')[1])
@@ -229,13 +311,51 @@ class LogicalAgent:
             if len(safe_neighbors) == len(neighbors) - 1:
                 wumpus_location = [n for n in neighbors if n not in safe_neighbors][0]
                 self.kb.tell(f"Wumpus at {wumpus_location}")
-                # Marcar como peligroso también
                 self.kb.tell(f"Danger at {wumpus_location}")
-                
-        # DEPURACIÓN: Ver qué peligros se detectaron
+        
+        # Regla 6: Inferencia mejorada para múltiples hedores
+        if len(stench_facts) >= 2:
+            stench_locations = [eval(fact.split(' at ')[1]) for fact in stench_facts]
+            possible_wumpus_locations = set()
+            
+            # Encontrar intersección de vecinos de todas las casillas con hedor
+            for i, loc1 in enumerate(stench_locations):
+                neighbors1 = set(self.world.get_neighbors(loc1[0], loc1[1]))
+                for j, loc2 in enumerate(stench_locations):
+                    if i != j:
+                        neighbors2 = set(self.world.get_neighbors(loc2[0], loc2[1]))
+                        intersection = neighbors1.intersection(neighbors2)
+                        possible_wumpus_locations.update(intersection)
+            
+            # Si solo hay una ubicación posible, es el Wumpus
+            possible_wumpus_locations = [loc for loc in possible_wumpus_locations 
+                                    if not self.kb.ask(f"Safe at {loc}")]
+            
+            if len(possible_wumpus_locations) == 1:
+                wumpus_loc = possible_wumpus_locations[0]
+                self.kb.tell(f"Wumpus at {wumpus_loc}")
+                self.kb.tell(f"Danger at {wumpus_loc}")
+                print(f"DEBUG: Wumpus inferido en {wumpus_loc} por múltiples hedores")
+
+        # Regla 7: Si no hay brisa, todos los vecinos son seguros de pozos
+        no_breeze_facts = self.kb.get_facts_starting_with("No Breeze at")
+        for fact in no_breeze_facts:
+            x, y = eval(fact.split(' at ')[1])
+            for nx, ny in self.world.get_neighbors(x, y):
+                if not self.kb.ask(f"Danger at ({nx}, {ny})"):
+                    self.kb.tell(f"Safe at ({nx}, {ny})")
+                        
+        # Ver qué peligros se detectaron
         danger_facts = [f for f in self.kb.facts if 'Danger' in f]
+        wumpus_facts = [f for f in self.kb.facts if 'Wumpus at' in f]
+        pit_facts = [f for f in self.kb.facts if 'Pit at' in f]
+        
         if danger_facts:
             print(f"DEBUG: Peligros inferidos: {danger_facts}")
+        if wumpus_facts:
+            print(f"DEBUG: Wumpus inferido en: {wumpus_facts}")
+        if pit_facts:
+            print(f"DEBUG: Pozos inferidos en: {pit_facts}")
 
     def elegir_accion(self):
         """
@@ -259,35 +379,121 @@ class LogicalAgent:
         if self._is_valid_and_get_action('left'): acciones_posibles.append('move_left')
         if self._is_valid_and_get_action('right'): acciones_posibles.append('move_right')
         
+        # Lógica más para disparar flechas
+        if self.world.agent_has_arrow:
+            # Opción 1: Si se sabe exactamente dónde está el Wumpus, disparar
+            wumpus_facts = self.kb.get_facts_starting_with("Wumpus at")
+            if wumpus_facts:
+                wumpus_location = eval(wumpus_facts[0].split(' at ')[1])
+                # Determinar dirección para disparar
+                if wumpus_location[0] == self.location[0]:  # Misma columna
+                    if wumpus_location[1] > self.location[1]:
+                        return ('shoot_arrow', 'up')
+                    else:
+                        return ('shoot_arrow', 'down')
+                elif wumpus_location[1] == self.location[1]:  # Misma fila
+                    if wumpus_location[0] > self.location[0]:
+                        return ('shoot_arrow', 'right')
+                    else:
+                        return ('shoot_arrow', 'left')
+            
+            # Opción 2: Si el hedor persiste, considerar disparar
+            stench_facts = self.kb.get_facts_starting_with("Stench at")
+            if len(stench_facts) >= 2:  # Solo disparar si hay múltiples hedores
+                print("DEBUG: Hedor persistente detectado, considerando disparar...")
+                
+                # Obtener vecinos no visitados y peligrosos
+                vecinos_no_visitados = [v for v in vecinos if v not in self.visited_squares]
+                vecinos_peligrosos = [v for v in vecinos_no_visitados if self.kb.ask(f"Danger at {v}")]
+                
+                if vecinos_peligrosos:
+                    target = vecinos_peligrosos[0]
+                    print(f"DEBUG: Disparando hacia vecino peligroso: {target}")
+                    
+                    # Determinar dirección del disparo
+                    x, y = self.location
+                    tx, ty = target
+                    
+                    if tx == x and ty == y + 1:
+                        return ('shoot_arrow', 'up')
+                    elif tx == x and ty == y - 1:
+                        return ('shoot_arrow', 'down')
+                    elif tx == x - 1 and ty == y:
+                        return ('shoot_arrow', 'left')
+                    elif tx == x + 1 and ty == y:
+                        return ('shoot_arrow', 'right')
 
         random.shuffle(acciones_posibles) # Para evitar bucles entre dos casillas
 
-        accion_segura_no_visitada = None
-        accion_segura_visitada = None
+        # Clasificar acciones por seguridad
+        acciones_seguras_no_visitadas = []
+        acciones_seguras_visitadas = []
+        acciones_riesgosas = []
 
         for action in acciones_posibles:
             vecino = self._get_target_location(action)
             
-            # EVITAR casillas peligrosas
+            # EVITAR casillas peligrosas confirmadas
             if self.kb.ask(f"Danger at {vecino}"):
-                continue  # Saltar esta acción
+                continue
 
-            # ASK a la KB
+            # Clasificar por nivel de seguridad
             if self.kb.ask(f"Safe at {vecino}"):
                 if vecino not in self.visited_squares:
-                    accion_segura_no_visitada = action
-                    break # ¡Esta es la mejor opción!
+                    acciones_seguras_no_visitadas.append(action)
                 else:
-                    accion_segura_visitada = action # Es una opción de retroceso
+                    acciones_seguras_visitadas.append(action)
+            else:
+                # NUEVO: Solo considerar riesgosas si no hay brisa actual
+                percepts_actuales = self.world.get_percepts_at(self.location)
+                if not percepts_actuales['breeze']:
+                    acciones_riesgosas.append(action)
 
         # Decidir basado en la prioridad
-        if accion_segura_no_visitada:
-            return accion_segura_no_visitada
-        elif accion_segura_visitada:
-            return accion_segura_visitada
+        if acciones_seguras_no_visitadas:
+            self.path_stack.append(self.location)
+            return random.choice(acciones_seguras_no_visitadas)
+        elif acciones_seguras_visitadas:
+            self.path_stack.append(self.location)
+            return random.choice(acciones_seguras_visitadas)
+        elif acciones_riesgosas and len(self.visited_squares) > 3:
+            # Solo considerar movimientos riesgosos si hemos explorado suficiente
+            # y no hay brisa en la ubicación actual
+            percepts_actuales = self.world.get_percepts_at(self.location)
+            if not percepts_actuales['breeze']:
+                print(f"DEBUG: Considerando movimiento riesgoso (sin brisa actual)")
+                self.path_stack.append(self.location)
+                return random.choice(acciones_riesgosas)
         else:
-            # No hay ningún lugar seguro conocido a donde ir.
-            return 'climb_out'
+            # Realizar backtracking si no hay movimientos seguros
+            if len(self.path_stack) > 1:
+                previous_location = self.path_stack.pop()
+                return self._get_backtrack_action(previous_location)
+            else:
+                # No hay ningún lugar seguro conocido a donde ir.
+                return 'climb_out'
+
+    def _get_backtrack_action(self, target_location):
+        """Determina la acción para retroceder a una ubicación anterior"""
+        x, y = self.location
+        tx, ty = target_location
+        
+        if tx == x and ty == y + 1:
+            return 'move_up'
+        elif tx == x and ty == y - 1:
+            return 'move_down'
+        elif tx == x - 1 and ty == y:
+            return 'move_left'
+        elif tx == x + 1 and ty == y:
+            return 'move_right'
+        else:
+            # Si no es un movimiento directo, elegir una dirección aleatoria
+            acciones = []
+            if self._is_valid_and_get_action('up'): acciones.append('move_up')
+            if self._is_valid_and_get_action('down'): acciones.append('move_down')
+            if self._is_valid_and_get_action('left'): acciones.append('move_left')
+            if self._is_valid_and_get_action('right'): acciones.append('move_right')
+            return random.choice(acciones) if acciones else 'climb_out'
 
     # --- Métodos Ayudantes (No modificar) ---
 
@@ -337,12 +543,33 @@ class LogicalAgent:
             self.inferir_seguridad()
 
             # 3. DECIDE (ASK)
-            action = self.elegir_accion()
-            print(f"Agente decide: {action}")
+            action_result = self.elegir_accion()
+            if isinstance(action_result, tuple):
+                action, direction = action_result
+                print(f"Agente decide: {action} hacia {direction}")
+            else:
+                action = action_result
+                print(f"Agente decide: {action}")
 
             # 4. ACTÚA
-            result = self.world.execute_action(action)
+            if isinstance(action_result, tuple):
+                result = self.world.execute_action(action, direction)
+            else:
+                result = self.world.execute_action(action)
             print(f"Resultado: {result}")
+
+            # Actualizar estado si el Wumpus fue eliminado
+            if "grito" in result.lower() or "matado" in result.lower():
+                self.wumpus_killed = True
+                # Limpiar hechos relacionados con el Wumpus
+                wumpus_facts = self.kb.get_facts_starting_with("Wumpus at")
+                for fact in wumpus_facts:
+                    self.kb.facts.remove(fact)
+                # Actualizar percepciones de hedor
+                stench_facts = self.kb.get_facts_starting_with("Stench at")
+                for fact in stench_facts:
+                    self.kb.facts.remove(fact)
+                    self.kb.tell(fact.replace("Stench", "No Stench"))
 
             if "¡VICTORIA!" in result or "escapó" in result or "¡MUERTE!" in result:
                 break
@@ -374,6 +601,7 @@ class WumpusGUI:
         self.YELLOW = (255, 255, 0)
         self.BROWN = (165, 42, 42)
         self.PURPLE = (128, 0, 128)
+        self.ORANGE = (255, 165, 0)
         
         # Inicializar Pygame
         pygame.init()
@@ -414,8 +642,8 @@ class WumpusGUI:
                 # Dibujar elementos
                 cell_content = self.world.board[(x, y)]
                 
-                # Wumpus (rojo)
-                if 'W' in cell_content and (not self.world.agent_is_alive or self.game_state != "Ejecutando"):
+                # Wumpus (rojo) - solo si está vivo
+                if 'W' in cell_content and self.world.wumpus_is_alive and (not self.world.agent_is_alive or self.game_state != "Ejecutando"):
                     pygame.draw.circle(self.screen, self.RED, 
                                      (rect_x + self.cell_size // 2, rect_y + self.cell_size // 2), 
                                      self.cell_size // 3)
@@ -440,6 +668,15 @@ class WumpusGUI:
                     pygame.draw.circle(self.screen, agent_color, 
                                      (rect_x + self.cell_size // 2, rect_y + self.cell_size // 2), 
                                      self.cell_size // 6)
+                    
+                    # Dibujar flecha si el agente la tiene
+                    if self.world.agent_has_arrow:
+                        arrow_color = self.ORANGE
+                        pygame.draw.polygon(self.screen, arrow_color, [
+                            (rect_x + self.cell_size - 10, rect_y + 10),
+                            (rect_x + self.cell_size - 20, rect_y + 5),
+                            (rect_x + self.cell_size - 20, rect_y + 15)
+                        ])
                 
                 # Coordenadas
                 coord_text = self.font.render(f"({x},{y})", True, self.BLACK)
@@ -492,31 +729,46 @@ class WumpusGUI:
         agent_items = [
             f"Vivo: {'SÍ' if self.world.agent_is_alive else 'NO'}",
             f"Tiene oro: {'SÍ' if self.world.agent_has_gold else 'NO'}",
+            f"Tiene flecha: {'SÍ' if self.world.agent_has_arrow else 'NO'}",
+            f"Wumpus vivo: {'SÍ' if self.world.wumpus_is_alive else 'NO'}",
             f"Casillas visitadas: {len(self.agent.visited_squares)}"
         ]
         
         for i, item in enumerate(agent_items):
             color = self.GREEN if "SÍ" in item and "Vivo" in item else self.WHITE
             color = self.YELLOW if "SÍ" in item and "oro" in item else color
+            color = self.RED if "SÍ" in item and "Wumpus vivo" in item else color
             text = self.font.render(item, True, color)
             self.screen.blit(text, (panel_x + 10, agent_y + 30 + i * 25))
         
         # Base de conocimiento (algunos hechos)
-        kb_y = agent_y + 120
+        kb_y = agent_y + 150
         kb_title = self.font.render("Base de Conocimiento:", True, self.WHITE)
         self.screen.blit(kb_title, (panel_x, kb_y))
         
         safe_cells = [f for f in self.agent.kb.facts if f.startswith("Safe at")]
-        kb_items = [f"Hechos seguros: {len(safe_cells)}"]
+        danger_cells = [f for f in self.agent.kb.facts if f.startswith("Danger at")]
+        kb_items = [
+            f"Hechos seguros: {len(safe_cells)}",
+            f"Hechos peligrosos: {len(danger_cells)}"
+        ]
         
-        # Mostrar algunos hechos de seguridad
-        for i, fact in enumerate(list(safe_cells)[:5]):
-            if i < 5:  # Mostrar máximo 5 hechos
-                text = self.font.render(fact, True, self.GREEN)
-                self.screen.blit(text, (panel_x + 10, kb_y + 30 + i * 20))
+        for i, item in enumerate(kb_items):
+            text = self.font.render(item, True, self.WHITE)
+            self.screen.blit(text, (panel_x + 10, kb_y + 30 + i * 20))
+        
+        # Mostrar algunos hechos de seguridad y peligro
+        fact_y = kb_y + 80
+        for i, fact in enumerate(list(safe_cells)[:3]):
+            text = self.font.render(fact, True, self.GREEN)
+            self.screen.blit(text, (panel_x + 10, fact_y + i * 20))
+        
+        for i, fact in enumerate(list(danger_cells)[:3]):
+            text = self.font.render(fact, True, self.RED)
+            self.screen.blit(text, (panel_x + 150, fact_y + i * 20))
         
         # Controles
-        controls_y = kb_y + 150
+        controls_y = fact_y + 80
         controls_title = self.font.render("Controles:", True, self.WHITE)
         self.screen.blit(controls_title, (panel_x, controls_y))
         
@@ -538,7 +790,7 @@ class WumpusGUI:
 
     def run_step(self):
         """Ejecuta un paso del agente"""
-        if not self.world.agent_is_alive or self.world.agent_has_gold and self.world.agent_location == (1, 1):
+        if not self.world.agent_is_alive or (self.world.agent_has_gold and self.world.agent_location == (1, 1)):
             self.game_state = "Terminado"
             if not self.world.agent_is_alive:
                 self.message = "¡EL AGENTE MURIÓ! Presiona R para reiniciar"
@@ -560,11 +812,28 @@ class WumpusGUI:
         self.agent.inferir_seguridad()
         
         # Elegir y ejecutar acción
-        action = self.agent.elegir_accion()
-        result = self.world.execute_action(action)
+        action_result = self.agent.elegir_accion()
+        if isinstance(action_result, tuple):
+            action, direction = action_result
+            result = self.world.execute_action(action, direction)
+            self.message = f"Paso {self.current_step}: {action} {direction} -> {result}"
+        else:
+            action = action_result
+            result = self.world.execute_action(action)
+            self.message = f"Paso {self.current_step}: {action} -> {result}"
         
-        # Actualizar mensaje
-        self.message = f"Paso {self.current_step}: {action} -> {result}"
+        # Actualizar si el Wumpus fue eliminado
+        if "grito" in result.lower() or "matado" in result.lower():
+            self.agent.wumpus_killed = True
+            # Limpiar hechos relacionados con el Wumpus
+            wumpus_facts = self.agent.kb.get_facts_starting_with("Wumpus at")
+            for fact in wumpus_facts:
+                self.agent.kb.facts.remove(fact)
+            # Actualizar percepciones de hedor
+            stench_facts = self.agent.kb.get_facts_starting_with("Stench at")
+            for fact in stench_facts:
+                self.agent.kb.facts.remove(fact)
+                self.agent.kb.tell(fact.replace("Stench", "No Stench"))
 
     def reset_game(self):
         """Reinicia el juego"""
